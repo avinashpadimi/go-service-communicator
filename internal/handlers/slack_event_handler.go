@@ -10,17 +10,23 @@ import (
 	"github.com/slack-go/slack/slackevents"
 )
 
+const maxHistory = 10
+
 // SlackEventHandler handles Slack event subscriptions.
 type SlackEventHandler struct {
-	slackClient *slack.Client
-	agent       *agent.Processor
+	slackClient         *slack.Client
+	agent               *agent.Processor
+	botUserID           string
+	conversationHistory map[string][]string
 }
 
 // NewSlackEventHandler creates a new SlackEventHandler.
-func NewSlackEventHandler(slackClient *slack.Client, agent *agent.Processor) *SlackEventHandler {
+func NewSlackEventHandler(slackClient *slack.Client, agent *agent.Processor, botUserID string) *SlackEventHandler {
 	return &SlackEventHandler{
-		slackClient: slackClient,
-		agent:       agent,
+		slackClient:         slackClient,
+		agent:               agent,
+		botUserID:           botUserID,
+		conversationHistory: make(map[string][]string),
 	}
 }
 
@@ -51,17 +57,49 @@ func (h *SlackEventHandler) HandleEvent(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if eventsAPIEvent.Type == slackevents.CallbackEvent {
-		innerEvent := eventsAPIEvent.InnerEvent
-		switch ev := innerEvent.Data.(type) {
-		case *slackevents.AppMentionEvent:
-			// Don't respond to messages from the bot itself.
-			if ev.User == "" {
-				return
+		// Acknowledge the event immediately to prevent Slack from retrying.
+		w.WriteHeader(http.StatusOK)
+
+		// Run the actual processing in a goroutine.
+		go func() {
+			innerEvent := eventsAPIEvent.InnerEvent
+			switch ev := innerEvent.Data.(type) {
+			case *slackevents.AppMentionEvent:
+				// Ignore messages from the bot itself
+				if ev.User == h.botUserID {
+					return
+				}
+				// For mentions, we don't use history, just a direct response.
+				response := h.agent.ProcessMessage(ev.Text)
+				h.slackClient.SendMessage(ev.Channel, response)
+
+			case *slackevents.MessageEvent:
+				// Handle direct messages to the bot
+				if ev.ChannelType == "im" {
+					// Ignore messages from the bot itself to prevent loops
+					if ev.User == h.botUserID {
+						return
+					}
+
+					// Retrieve conversation history
+					history := h.conversationHistory[ev.User]
+
+					// Get the AI's response
+					response := h.agent.ProcessDM(ev.User, history, ev.Text)
+
+					// Update history with the new turn
+					history = append(history, "User: "+ev.Text)
+					history = append(history, "Assistant: "+response)
+
+					// Trim history to keep it from growing indefinitely
+					if len(history) > maxHistory {
+						history = history[len(history)-maxHistory:]
+					}
+					h.conversationHistory[ev.User] = history
+
+					h.slackClient.SendMessage(ev.Channel, response)
+				}
 			}
-			// Get the processed response from the agent.
-			response := h.agent.ProcessMessage(ev.Text)
-			// Send the response back to the channel.
-			h.slackClient.SendMessage(ev.Channel, response)
-		}
+		}()
 	}
 }

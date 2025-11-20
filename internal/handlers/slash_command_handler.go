@@ -59,7 +59,7 @@ func (h *SlashCommandHandler) HandleCommand(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusOK)
 
 		// Run the actual logic in a goroutine to avoid blocking.
-		go h.processSummaryCommand(s.ChannelID, s.Text)
+		go h.processSummaryCommand(s.UserID, s.ChannelID, s.Text)
 
 	default:
 		w.WriteHeader(http.StatusBadRequest)
@@ -67,7 +67,7 @@ func (h *SlashCommandHandler) HandleCommand(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-func (h *SlashCommandHandler) processSummaryCommand(requestChannelID, commandText string) {
+func (h *SlashCommandHandler) processSummaryCommand(userID, requestChannelID, commandText string) {
 	duration := 24 * time.Hour // Default to 24 hours
 	var err error
 
@@ -84,23 +84,15 @@ func (h *SlashCommandHandler) processSummaryCommand(requestChannelID, commandTex
 	startTime := endTime.Add(-duration)
 	jiraQuery := "status=new"
 
-	publicChannels, err := h.slackClient.GetPublicChannels()
+	messages, err := h.slackClient.GetConversationHistory(requestChannelID, startTime, endTime)
 	if err != nil {
 		// Log the error, and optionally send an error message to the user.
-		h.slackClient.SendMessage(requestChannelID, "Error: Could not fetch public channels.")
+		h.slackClient.SendMessage(requestChannelID, "Error: Could not fetch message history for this channel. Make sure I have been invited by using '/invite @<bot-name>'.")
 		return
 	}
-	fmt.Println("public channels:", publicChannels)
 
-	var allMessages []string
-	for _, channelID := range publicChannels {
-		messages, err := h.slackClient.GetConversationHistory(channelID, startTime, endTime)
-		if err != nil {
-			// Log the error, maybe skip this channel and continue.
-			continue
-		}
-		allMessages = append(allMessages, messages...)
-	}
+	// Use the fetched messages directly
+	allMessages := messages
 
 	jiraIssues, err := h.jiraClient.FetchIssues(jiraQuery)
 	if err != nil {
@@ -109,7 +101,10 @@ func (h *SlashCommandHandler) processSummaryCommand(requestChannelID, commandTex
 		return
 	}
 
-	summary := h.agent.ConsolidateInfo(allMessages, jiraIssues)
+	summary := h.agent.ConsolidateInfo(userID, allMessages, jiraIssues)
+
+	// Store the summary for potential follow-up questions in a DM.
+	h.agent.SetLastSummary(userID, summary)
 
 	h.slackClient.SendMessage(requestChannelID, summary)
 }

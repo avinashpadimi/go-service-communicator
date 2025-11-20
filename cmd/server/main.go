@@ -23,7 +23,14 @@ func main() {
 	// Initialize services
 	slackClient := slack.New(cfg.Slack.Token)
 	jiraClient := jira.New()
-	agentProcessor := agent.New(cfg.Gemini.APIKey)
+	agentProcessor := agent.New(cfg.Gemini.APIKey, slackClient)
+
+	// Get bot's own user ID to prevent loops
+	authTest, err := slackClient.AuthTest()
+	if err != nil {
+		log.Fatalf("could not authenticate with Slack: %v", err)
+	}
+	botUserID := authTest.UserID
 
 	// Create a map of services
 	communicators := map[string]services.Communicator{
@@ -33,7 +40,7 @@ func main() {
 
 	// Initialize handlers
 	multiServiceHandler := handlers.NewMultiServiceHandler(communicators)
-	slackEventHandler := handlers.NewSlackEventHandler(slackClient, agentProcessor)
+	slackEventHandler := handlers.NewSlackEventHandler(slackClient, agentProcessor, botUserID)
 	slashCommandHandler := handlers.NewSlashCommandHandler(slackClient, jiraClient, agentProcessor, cfg.Slack.SigningSecret)
 
 	// Create router
@@ -45,8 +52,8 @@ func main() {
 	r.HandleFunc("/slack/command", slashCommandHandler.HandleCommand).Methods("POST")
 
 	// Start server
-	log.Println("Starting server on :8080")
-	if err := http.ListenAndServe(":8081", r); err != nil {
+	log.Println("Starting server on :8082")
+	if err := http.ListenAndServe(":8082", r); err != nil {
 		log.Fatalf("could not start server: %v", err)
 	}
 }

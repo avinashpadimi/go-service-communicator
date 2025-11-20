@@ -23,7 +23,12 @@ func GenerateContent(ctx context.Context, apiKey, prompt string) (string, error)
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-pro-latest")
+	log.Println("---------------------------------")
+	log.Printf("Sending prompt to Gemini:\n%s", prompt)
+	log.Println("---------------------------------")
+
+
+	model := client.GenerativeModel("gemini-pro-latest") // Using a known stable model
 	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
 		log.Printf("Failed to generate content: %v", err)
@@ -42,6 +47,11 @@ func GenerateContent(ctx context.Context, apiKey, prompt string) (string, error)
 			}
 		}
 	}
+
+	log.Println("---------------------------------")
+	log.Printf("Received response from Gemini:\n%s", responseText)
+	log.Println("---------------------------------")
+
 
 	return responseText, nil
 }
