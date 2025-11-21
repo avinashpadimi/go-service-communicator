@@ -97,9 +97,11 @@ Example of a simple response:
 	// Check for specific intents
 	lowerMessage := strings.ToLower(latestMessage)
 	if strings.Contains(lowerMessage, "summary") || strings.Contains(lowerMessage, "summarize") {
+		p.slackClient.SendMessage(userID, "Working on your summary. This might take a moment...")                                                                                                                                  
 		return p.performSummary(userID, latestMessage, "") // Pass empty channelID
 	}
 	if strings.Contains(lowerMessage, "mentions") || strings.Contains(lowerMessage, "tagged") || strings.Contains(lowerMessage, "missed") {
+		p.slackClient.SendMessage(userID, "Working on your request. This might take a moment...")                                                                                                                                  
 		return p.findUserMentions(userID)
 	}
 
