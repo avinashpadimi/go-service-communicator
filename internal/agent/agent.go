@@ -5,19 +5,21 @@ import (
 	"fmt"
 	"log"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gemini/go-service-communicator/internal/llm"
 	"github.com/gemini/go-service-communicator/internal/services/slack"
+	"github.com/gemini/go-service-communicator/internal/util"
+	slackgo "github.com/slack-go/slack"
 )
 
 // SummaryContext holds information about the last summary generated for a user.
 type SummaryContext struct {
-	Summary   string
-	ChannelID string
+	Summary     string
+	ChannelID   string
+	InitialData []slackgo.Message
 }
 
 // Processor is the agent that handles business logic.
@@ -38,11 +40,11 @@ func New(apiKey string, slackClient *slack.Client) *Processor {
 }
 
 // SetLastSummary stores the most recent summary generated for a user.
-func (p *Processor) SetLastSummary(userID, channelID, summary string) {
+func (p *Processor) SetLastSummary(userID, channelID, summary string, initialData []slackgo.Message) {
 	p.summaryMutex.Lock()
 	defer p.summaryMutex.Unlock()
 	log.Printf("Storing summary context for user %s in channel %s", userID, channelID)
-	p.lastSummary[userID] = SummaryContext{Summary: summary, ChannelID: channelID}
+	p.lastSummary[userID] = SummaryContext{Summary: summary, ChannelID: channelID, InitialData: initialData}
 }
 
 // ProcessMessage is for simple, non-contextual AI responses (e.g., for @mentions).
@@ -106,12 +108,23 @@ Example of a simple response:
 	p.summaryMutex.Lock()
 	if summaryCtx, ok := p.lastSummary[userID]; ok {
 		log.Printf("Found summary context for user %s", userID)
-		builder.WriteString("CONTEXT: The user was just shown the following summary. Use this summary to answer any follow-up questions.\n--- SUMMARY START ---\n")
-		builder.WriteString(summaryCtx.Summary)
+		builder.WriteString("CONTEXT: The user was just shown the following summary. Use this summary and the initial data to answer any follow-up questions.\n")
 		if summaryCtx.ChannelID != "" {
-			builder.WriteString(fmt.Sprintf("\n(The summary was for channel %s)", summaryCtx.ChannelID))
+			builder.WriteString(fmt.Sprintf("(The summary was for channel %s)\n", summaryCtx.ChannelID))
 		}
+		builder.WriteString("--- SUMMARY START ---\n")
+		builder.WriteString(summaryCtx.Summary)
 		builder.WriteString("\n--- SUMMARY END ---\n\n")
+
+		if len(summaryCtx.InitialData) > 0 {
+			builder.WriteString("--- INITIAL DATA START ---\n")
+			formattedMessages := formatMessagesForLLM(summaryCtx.InitialData, p.slackClient, userID)
+			for _, data := range formattedMessages {
+				builder.WriteString(data + "\n")
+			}
+			builder.WriteString("--- INITIAL DATA END ---\n\n")
+		}
+
 		// The summary context is now loaded. Delete it so it's not used in the *next* turn.
 		delete(p.lastSummary, userID)
 	}
@@ -138,14 +151,20 @@ Example of a simple response:
 func (p *Processor) performSummary(userID, message, channelID string) string {
 	// Default to 1 day if parsing fails
 	duration := 24 * time.Hour
-	// Try to parse a duration from the message (e.g., "10 days")
-	re := regexp.MustCompile(`(\d+)\s*d`)
-	matches := re.FindStringSubmatch(message)
-	if len(matches) == 2 {
-		days, err := strconv.Atoi(matches[1])
+	durationRegex := regexp.MustCompile(`(\d+\s*(hour|day|month|year)s?|\d+(h|d|m|y))`)
+	match := durationRegex.FindString(message)
+	if match != "" {
+		parsedDuration, err := util.ParseDuration(match)
 		if err == nil {
-			duration = time.Duration(days) * 24 * time.Hour
+			duration = parsedDuration
 		}
+	}
+
+	// Try to parse a channel ID from the message
+	channelRegex := regexp.MustCompile(`<#(C[A-Z0-9]{10})\|.*?>`)
+	matches := channelRegex.FindStringSubmatch(message)
+	if len(matches) == 2 {
+		channelID = matches[1]
 	}
 
 	endTime := time.Now()
@@ -163,23 +182,24 @@ func (p *Processor) performSummary(userID, message, channelID string) string {
 		channelsToSummarize = publicChannels
 	}
 
-	var allMessages []string
+	var allRawMessages []slackgo.Message
 	for _, chID := range channelsToSummarize {
 		messages, err := p.slackClient.GetConversationHistory(chID, startTime, endTime)
 		if err != nil {
 			log.Printf("Error fetching history for channel %s: %v", chID, err)
 			continue // Skip channels we can't access
 		}
-		// Highlight mentions of the user in the messages before sending to AI
-		for i, msg := range messages {
-			messages[i] = highlightMentions(msg, userID)
+		for i := range messages {
+			messages[i].Channel = chID
 		}
-		allMessages = append(allMessages, messages...)
+		allRawMessages = append(allRawMessages, messages...)
 	}
 
-	if len(allMessages) == 0 {
+	if len(allRawMessages) == 0 {
 		return "I couldn't find any messages in the specified time period."
 	}
+
+	formattedMessages := formatMessagesForLLM(allRawMessages, p.slackClient, userID)
 
 	// Create a prompt for the AI to summarize
 	var promptBuilder strings.Builder
@@ -208,7 +228,7 @@ Example of the desired format:
 
 Slack Messages:
 `)
-	for _, msg := range allMessages {
+	for _, msg := range formattedMessages {
 		promptBuilder.WriteString("- " + msg + "\n")
 	}
 
@@ -218,7 +238,7 @@ Slack Messages:
 	}
 
 	cleanSummary := cleanGeminiResponse(summary)
-	p.SetLastSummary(userID, channelID, cleanSummary)
+	p.SetLastSummary(userID, channelID, cleanSummary, allRawMessages)
 	return cleanSummary
 }
 
@@ -256,46 +276,10 @@ func (p *Processor) findUserMentions(userID string) string {
 	return builder.String()
 }
 
-// continueConversation handles a regular conversational turn.
-func (p *Processor) continueConversation(userID string, history []string) string {
-	var builder strings.Builder
-	builder.WriteString("You are a helpful and friendly conversational AI assistant. Continue the following conversation naturally.\n\n")
-
-	// Check if there's a recent summary to add as context.
-	p.summaryMutex.Lock()
-	if summaryCtx, ok := p.lastSummary[userID]; ok {
-		log.Printf("Found summary context for user %s", userID)
-		builder.WriteString("CONTEXT: The user was just shown the following summary. Use this summary to answer any follow-up questions.\n--- SUMMARY START ---\n")
-		builder.WriteString(summaryCtx.Summary)
-		if summaryCtx.ChannelID != "" {
-			builder.WriteString(fmt.Sprintf("\n(The summary was for channel %s)", summaryCtx.ChannelID))
-		}
-		builder.WriteString("\n--- SUMMARY END ---\n\n")
-		// The summary context is now loaded. Delete it so it's not used in the *next* turn.
-		delete(p.lastSummary, userID)
-	}
-	p.summaryMutex.Unlock()
-
-	builder.WriteString("--- CONVERSATION HISTORY ---\n")
-	for _, msg := range history {
-		builder.WriteString(msg + "\n")
-	}
-	// Add the latest message from the user to the history for the AI
-	builder.WriteString("--- END HISTORY ---\n\n")
-	builder.WriteString("Assistant:")
-
-	prompt := builder.String()
-
-	response, err := llm.GenerateContent(context.Background(), p.apiKey, prompt)
-	if err != nil {
-		return response // Error message is already formatted
-	}
-	return cleanGeminiResponse(response)
-}
-
 // ConsolidateInfo uses the AI to create a summary from Slack messages and Jira issues.
 // This is used by the /summary slash command.
-func (p *Processor) ConsolidateInfo(userID string, slackMessages, jiraIssues []string) string { // Added userID
+func (p *Processor) ConsolidateInfo(userID string, slackMessages []slackgo.Message, jiraIssues []string) string {
+	formattedMessages := formatMessagesForLLM(slackMessages, p.slackClient, userID)
 	var builder strings.Builder
 	builder.WriteString(`Please provide a concise summary of the following activities in Slack's Block Kit JSON format. The JSON should be a valid array of blocks.
 
@@ -345,10 +329,10 @@ Example of the desired format:
 
 `)
 
-	if len(slackMessages) > 0 {
+	if len(formattedMessages) > 0 {
 		builder.WriteString("Slack Conversations:\n")
-		for _, msg := range slackMessages {
-			builder.WriteString(fmt.Sprintf("- %s\n", highlightMentions(msg, userID))) // Highlight mentions
+		for _, msg := range formattedMessages {
+			builder.WriteString(fmt.Sprintf("- %s\n", msg))
 		}
 	}
 
@@ -359,7 +343,7 @@ Example of the desired format:
 		}
 	}
 
-	if len(slackMessages) == 0 && len(jiraIssues) == 0 {
+	if len(formattedMessages) == 0 && len(jiraIssues) == 0 {
 		return "There were no activities to summarize in the given time period."
 	}
 
@@ -370,6 +354,23 @@ Example of the desired format:
 		return "I was able to fetch the activities, but I encountered an error while generating the summary."
 	}
 	return cleanGeminiResponse(summary)
+}
+
+func formatMessagesForLLM(messages []slackgo.Message, slackClient *slack.Client, userID string) []string {
+	var formattedMessages []string
+	for _, msg := range messages {
+		var userName string
+		if msg.BotID != "" {
+			userName = msg.Username
+		} else {
+			userName = slackClient.GetUserName(msg.User)
+		}
+
+		channelName := slackClient.GetChannelName(msg.Channel)
+		formattedMsg := fmt.Sprintf("[Channel: %s] %s: %s", channelName, userName, msg.Text)
+		formattedMessages = append(formattedMessages, highlightMentions(formattedMsg, userID))
+	}
+	return formattedMessages
 }
 
 // highlightMentions replaces mentions of the userID with a bolded version for Slack markdown.

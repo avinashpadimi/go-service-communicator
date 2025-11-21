@@ -14,17 +14,19 @@ import (
 
 // Client is a Slack client that uses the slack-go library.
 type Client struct {
-	api        *slack.Client
-	userCache  map[string]string
-	cacheMutex sync.Mutex
+	api          *slack.Client
+	userCache    map[string]string
+	channelCache map[string]string
+	cacheMutex   sync.Mutex
 }
 
 // New creates a new Slack client.
 func New(token string) *Client {
 	api := slack.New(token)
 	return &Client{
-		api:       api,
-		userCache: make(map[string]string),
+		api:          api,
+		userCache:    make(map[string]string),
+		channelCache: make(map[string]string),
 	}
 }
 
@@ -92,7 +94,7 @@ func (c *Client) formatText(message string) []slack.Block {
 }
 
 // GetConversationHistory fetches the conversation history from a channel.
-func (c *Client) GetConversationHistory(channelID string, start, end time.Time) ([]string, error) {
+func (c *Client) GetConversationHistory(channelID string, start, end time.Time) ([]slack.Message, error) {
 	log.Printf("Calling Slack API: conversations.history for channel %s", channelID)
 	params := &slack.GetConversationHistoryParameters{
 		ChannelID: channelID,
@@ -105,22 +107,16 @@ func (c *Client) GetConversationHistory(channelID string, start, end time.Time) 
 		return nil, err
 	}
 
-	var messages []string
-	for i := len(history.Messages) - 1; i >= 0; i-- {
-		msg := history.Messages[i]
-		if msg.BotID != "" {
-			messages = append(messages, fmt.Sprintf("%s (bot): %s", msg.Username, msg.Text))
-		} else {
-			userName := c.getUserName(msg.User)
-			messages = append(messages, fmt.Sprintf("%s (<@%s>): %s", userName, msg.User, msg.Text))
-		}
+	// Reverse the messages to be in chronological order
+	for i, j := 0, len(history.Messages)-1; i < j; i, j = i+1, j-1 {
+		history.Messages[i], history.Messages[j] = history.Messages[j], history.Messages[i]
 	}
 
-	return messages, nil
+	return history.Messages, nil
 }
 
-// getUserName fetches a user's name from the cache or the API.
-func (c *Client) getUserName(userID string) string {
+// GetUserName fetches a user's name from the cache or the API.
+func (c *Client) GetUserName(userID string) string {
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
@@ -136,6 +132,25 @@ func (c *Client) getUserName(userID string) string {
 
 	c.userCache[userID] = user.Name
 	return user.Name
+}
+
+// GetChannelName fetches a channel's name from the cache or the API.
+func (c *Client) GetChannelName(channelID string) string {
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+
+	if channelName, ok := c.channelCache[channelID]; ok {
+		return channelName
+	}
+
+	channel, err := c.api.GetConversationInfo(&slack.GetConversationInfoInput{ChannelID: channelID})
+	if err != nil {
+		log.Printf("Error getting channel info for %s: %v", channelID, err)
+		return channelID // Fallback to channel ID
+	}
+
+	c.channelCache[channelID] = channel.Name
+	return channel.Name
 }
 
 // GetPublicChannels fetches a list of all channels the bot is a member of, using cursor pagination.

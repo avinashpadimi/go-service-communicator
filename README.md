@@ -87,6 +87,7 @@ To enable all features of this application, you need to grant the following perm
 - `chat:write`: Send messages as your app.
 - `commands`: Add shortcuts and/or slash commands that people can use.
 - `app_mentions:read`: Read messages that directly mention your app in conversations.
+- `users:read`: View people in a workspace.
 
 ### Event Subscriptions
 
