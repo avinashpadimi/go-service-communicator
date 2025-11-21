@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/gemini/go-service-communicator/internal/agent"
 	"github.com/gemini/go-service-communicator/internal/services/slack"
@@ -69,9 +70,20 @@ func (h *SlackEventHandler) HandleEvent(w http.ResponseWriter, r *http.Request) 
 				if ev.User == h.botUserID {
 					return
 				}
-				// For mentions, we don't use history, just a direct response.
-				response := h.agent.ProcessMessage(ev.User, ev.Channel, ev.Text)
-				h.slackClient.SendMessage(ev.Channel, response)
+
+				lowerMessage := strings.ToLower(ev.Text)
+				if strings.Contains(lowerMessage, "summary") || strings.Contains(lowerMessage, "summarize") {
+					h.slackClient.SendEphemeralMessage(ev.Channel, ev.User, "Processing your request to summarize the channel...")
+
+					// Generate summary
+					summary := h.agent.ProcessMessage(ev.User, ev.Channel, ev.Text)
+
+					h.slackClient.SendEphemeralMessage(ev.Channel, ev.User, summary)
+				} else {
+					// For other mentions, just a direct response.
+					response := h.agent.ProcessMessage(ev.User, ev.Channel, ev.Text)
+					h.slackClient.SendMessage(ev.Channel, response)
+				}
 
 			case *slackevents.MessageEvent:
 				// Handle direct messages to the bot

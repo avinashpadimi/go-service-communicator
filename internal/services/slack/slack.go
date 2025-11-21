@@ -59,6 +59,26 @@ func (c *Client) SendMessage(channel, message string) error {
 	return postErr
 }
 
+// SendEphemeralMessage sends an ephemeral message to a user in a channel.
+func (c *Client) SendEphemeralMessage(channelID, userID, message string) error {
+	log.Printf("Calling Slack API: chat.postEphemeral to channel %s for user %s", channelID, userID)
+
+	// Try to unmarshal the message as Slack message blocks
+	var blocks slack.Blocks
+	err := json.Unmarshal([]byte(message), &blocks)
+	if err == nil {
+		// If unmarshalling succeeds, send the blocks.
+		_, err := c.api.PostEphemeral(channelID, userID, slack.MsgOptionBlocks(blocks.BlockSet...))
+		return err
+	}
+
+	// If unmarshalling fails, assume it's a plain text message and use formatText.
+	log.Printf("Could not unmarshal message as JSON blocks, formatting as plain text: %v", err)
+	formattedBlocks := c.formatText(message)
+	_, err = c.api.PostEphemeral(channelID, userID, slack.MsgOptionBlocks(formattedBlocks...))
+	return err
+}
+
 func (c *Client) formatText(message string) []slack.Block {
 	var blocks []slack.Block
 	lines := strings.Split(message, "\n")

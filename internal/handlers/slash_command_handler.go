@@ -67,6 +67,8 @@ func (h *SlashCommandHandler) HandleCommand(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *SlashCommandHandler) processSummaryCommand(userID, requestChannelID, commandText string) {
+	h.slackClient.SendEphemeralMessage(requestChannelID, userID, "Processing your request to summarize the channel...")
+
 	duration := 24 * time.Hour // Default to 24 hours
 	var err error
 
@@ -74,7 +76,7 @@ func (h *SlashCommandHandler) processSummaryCommand(userID, requestChannelID, co
 	if commandText != "" {
 		duration, err = util.ParseDuration(commandText)
 		if err != nil {
-			h.slackClient.SendMessage(requestChannelID, fmt.Sprintf("Error: Invalid time range format. Please use a format like '1h', '7d', '2m', or '1y'. Using default of 24h."))
+			h.slackClient.SendEphemeralMessage(requestChannelID, userID, fmt.Sprintf("Error: Invalid time range format. Please use a format like '1h', '7d', '2m', or '1y'. Using default of 24h."))
 			duration = 24 * time.Hour // Fallback to default
 		}
 	}
@@ -86,7 +88,7 @@ func (h *SlashCommandHandler) processSummaryCommand(userID, requestChannelID, co
 	rawMessages, err := h.slackClient.GetConversationHistory(requestChannelID, startTime, endTime)
 	if err != nil {
 		// Log the error, and optionally send an error message to the user.
-		h.slackClient.SendMessage(requestChannelID, "Error: Could not fetch message history for this channel. Make sure I have been invited by using '/invite @<bot-name>'.")
+		h.slackClient.SendEphemeralMessage(requestChannelID, userID, "Error: Could not fetch message history for this channel. Make sure I have been invited by using '/invite @<bot-name>'.")
 		return
 	}
 	for i := range rawMessages {
@@ -96,7 +98,7 @@ func (h *SlashCommandHandler) processSummaryCommand(userID, requestChannelID, co
 	jiraIssues, err := h.jiraClient.FetchIssues(jiraQuery)
 	if err != nil {
 		// Log the error.
-		h.slackClient.SendMessage(requestChannelID, "Error: Could not fetch Jira issues.")
+		h.slackClient.SendEphemeralMessage(requestChannelID, userID, "Error: Could not fetch Jira issues.")
 		return
 	}
 
@@ -105,5 +107,5 @@ func (h *SlashCommandHandler) processSummaryCommand(userID, requestChannelID, co
 	// Store the summary for potential follow-up questions in a DM.
 	h.agent.SetLastSummary(userID, requestChannelID, summary, rawMessages)
 
-	h.slackClient.SendMessage(requestChannelID, summary)
+	h.slackClient.SendEphemeralMessage(requestChannelID, userID, summary)
 }
