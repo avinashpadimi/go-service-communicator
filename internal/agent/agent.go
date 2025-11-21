@@ -14,11 +14,17 @@ import (
 	"github.com/gemini/go-service-communicator/internal/services/slack"
 )
 
+// SummaryContext holds information about the last summary generated for a user.
+type SummaryContext struct {
+	Summary   string
+	ChannelID string
+}
+
 // Processor is the agent that handles business logic.
 type Processor struct {
 	apiKey       string
 	slackClient  *slack.Client
-	lastSummary  map[string]string
+	lastSummary  map[string]SummaryContext
 	summaryMutex sync.Mutex
 }
 
@@ -27,37 +33,69 @@ func New(apiKey string, slackClient *slack.Client) *Processor {
 	return &Processor{
 		apiKey:      apiKey,
 		slackClient: slackClient,
-		lastSummary: make(map[string]string),
+		lastSummary: make(map[string]SummaryContext),
 	}
 }
 
 // SetLastSummary stores the most recent summary generated for a user.
-func (p *Processor) SetLastSummary(userID, summary string) {
+func (p *Processor) SetLastSummary(userID, channelID, summary string) {
 	p.summaryMutex.Lock()
 	defer p.summaryMutex.Unlock()
-	log.Printf("Storing summary context for user %s", userID)
-	p.lastSummary[userID] = summary
+	log.Printf("Storing summary context for user %s in channel %s", userID, channelID)
+	p.lastSummary[userID] = SummaryContext{Summary: summary, ChannelID: channelID}
 }
 
 // ProcessMessage is for simple, non-contextual AI responses (e.g., for @mentions).
-func (p *Processor) ProcessMessage(message string) string {
-	prompt := fmt.Sprintf("A user mentioned the bot with the following message. Please provide a helpful response.\n\nUser message: \"%s\"", message)
+func (p *Processor) ProcessMessage(userID, channelID, message string) string {
+	lowerMessage := strings.ToLower(message)
+	if strings.Contains(lowerMessage, "summary") || strings.Contains(lowerMessage, "summarize") {
+		return p.performSummary(userID, message, channelID)
+	}
+
+	prompt := fmt.Sprintf(`A user mentioned the bot with the following message. Please provide a helpful response in Slack's Block Kit JSON format. The JSON should be a valid array of blocks.
+
+Example of a simple response:
+[
+  {
+    "type": "section",
+    "text": {
+      "type": "mrkdwn",
+      "text": "This is a simple message."
+    }
+  }
+]
+
+User message: "%s"`, message)
 	response, err := llm.GenerateContent(context.Background(), p.apiKey, prompt)
 	if err != nil {
 		return response // Error message is already formatted
 	}
-	return response
+	return cleanGeminiResponse(response)
 }
 
 // ProcessDM is for conversational AI responses in direct messages.
 func (p *Processor) ProcessDM(userID string, history []string, latestMessage string) string {
 	var builder strings.Builder
-	builder.WriteString("You are a helpful and friendly conversational AI assistant. Continue the following conversation naturally.\n\n")
+	builder.WriteString(`You are a helpful and friendly conversational AI assistant. Continue the following conversation naturally.
+Please provide a response in Slack's Block Kit JSON format. The JSON should be a valid array of blocks.
+
+Example of a simple response:
+[
+  {
+    "type": "section",
+    "text": {
+      "type": "mrkdwn",
+      "text": "This is a simple message."
+    }
+  }
+]
+
+`)
 
 	// Check for specific intents
 	lowerMessage := strings.ToLower(latestMessage)
 	if strings.Contains(lowerMessage, "summary") || strings.Contains(lowerMessage, "summarize") {
-		return p.performSummary(userID, latestMessage) // Pass userID to performSummary
+		return p.performSummary(userID, latestMessage, "") // Pass empty channelID
 	}
 	if strings.Contains(lowerMessage, "mentions") || strings.Contains(lowerMessage, "tagged") || strings.Contains(lowerMessage, "missed") {
 		return p.findUserMentions(userID)
@@ -66,10 +104,13 @@ func (p *Processor) ProcessDM(userID string, history []string, latestMessage str
 
 	// Check if there's a recent summary to add as context.
 	p.summaryMutex.Lock()
-	if summary, ok := p.lastSummary[userID]; ok {
+	if summaryCtx, ok := p.lastSummary[userID]; ok {
 		log.Printf("Found summary context for user %s", userID)
-		builder.WriteString("CONTEXT: The user was just shown the following summary after using the /summary command. Use this summary to answer any follow-up questions.\n--- SUMMARY START ---\n")
-		builder.WriteString(summary)
+		builder.WriteString("CONTEXT: The user was just shown the following summary. Use this summary to answer any follow-up questions.\n--- SUMMARY START ---\n")
+		builder.WriteString(summaryCtx.Summary)
+		if summaryCtx.ChannelID != "" {
+			builder.WriteString(fmt.Sprintf("\n(The summary was for channel %s)", summaryCtx.ChannelID))
+		}
 		builder.WriteString("\n--- SUMMARY END ---\n\n")
 		// The summary context is now loaded. Delete it so it's not used in the *next* turn.
 		delete(p.lastSummary, userID)
@@ -82,7 +123,7 @@ func (p *Processor) ProcessDM(userID string, history []string, latestMessage str
 	}
 	builder.WriteString("User: " + latestMessage + "\n")
 	builder.WriteString("--- END HISTORY ---\n\n")
-	builder.WriteString("Assistant:")
+	builder.WriteString("Assistant (in JSON format):")
 
 	prompt := builder.String()
 
@@ -90,11 +131,11 @@ func (p *Processor) ProcessDM(userID string, history []string, latestMessage str
 	if err != nil {
 		return response // Error message is already formatted
 	}
-	return response
+	return cleanGeminiResponse(response)
 }
 
 // performSummary fetches channel history and generates a summary.
-func (p *Processor) performSummary(userID string, message string) string { // Added userID
+func (p *Processor) performSummary(userID, message, channelID string) string {
 	// Default to 1 day if parsing fails
 	duration := 24 * time.Hour
 	// Try to parse a duration from the message (e.g., "10 days")
@@ -110,17 +151,23 @@ func (p *Processor) performSummary(userID string, message string) string { // Ad
 	endTime := time.Now()
 	startTime := endTime.Add(-duration)
 
-	publicChannels, err := p.slackClient.GetPublicChannels()
-	if err != nil {
-		log.Printf("Error fetching public channels: %v", err)
-		return "Sorry, I couldn't fetch the list of public channels."
+	var channelsToSummarize []string
+	if channelID != "" {
+		channelsToSummarize = []string{channelID}
+	} else {
+		publicChannels, err := p.slackClient.GetPublicChannels()
+		if err != nil {
+			log.Printf("Error fetching public channels: %v", err)
+			return "Sorry, I couldn't fetch the list of public channels."
+		}
+		channelsToSummarize = publicChannels
 	}
 
 	var allMessages []string
-	for _, channelID := range publicChannels {
-		messages, err := p.slackClient.GetConversationHistory(channelID, startTime, endTime)
+	for _, chID := range channelsToSummarize {
+		messages, err := p.slackClient.GetConversationHistory(chID, startTime, endTime)
 		if err != nil {
-			log.Printf("Error fetching history for channel %s: %v", channelID, err)
+			log.Printf("Error fetching history for channel %s: %v", chID, err)
 			continue // Skip channels we can't access
 		}
 		// Highlight mentions of the user in the messages before sending to AI
@@ -131,12 +178,36 @@ func (p *Processor) performSummary(userID string, message string) string { // Ad
 	}
 
 	if len(allMessages) == 0 {
-		return "I couldn't find any messages in the public channels for the specified time period."
+		return "I couldn't find any messages in the specified time period."
 	}
 
 	// Create a prompt for the AI to summarize
 	var promptBuilder strings.Builder
-	promptBuilder.WriteString("Please provide a concise summary of the following Slack messages:\n\n")
+	promptBuilder.WriteString(`Please provide a concise summary of the following Slack messages in Slack's Block Kit JSON format.
+
+Example of the desired format:
+[
+    {
+        "type": "header",
+        "text": {
+            "type": "plain_text",
+            "text": "Summary of Public Channels"
+        }
+    },
+    {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": "Here is a summary of the recent conversations."
+        }
+    },
+    {
+        "type": "divider"
+    }
+]
+
+Slack Messages:
+`)
 	for _, msg := range allMessages {
 		promptBuilder.WriteString("- " + msg + "\n")
 	}
@@ -146,7 +217,9 @@ func (p *Processor) performSummary(userID string, message string) string { // Ad
 		return "I was able to fetch the messages, but I encountered an error while generating the summary."
 	}
 
-	return summary
+	cleanSummary := cleanGeminiResponse(summary)
+	p.SetLastSummary(userID, channelID, cleanSummary)
+	return cleanSummary
 }
 
 // findUserMentions searches for messages where the given userID was mentioned.
@@ -190,10 +263,13 @@ func (p *Processor) continueConversation(userID string, history []string) string
 
 	// Check if there's a recent summary to add as context.
 	p.summaryMutex.Lock()
-	if summary, ok := p.lastSummary[userID]; ok {
+	if summaryCtx, ok := p.lastSummary[userID]; ok {
 		log.Printf("Found summary context for user %s", userID)
-		builder.WriteString("CONTEXT: The user was just shown the following summary after using the /summary command. Use this summary to answer any follow-up questions.\n--- SUMMARY START ---\n")
-		builder.WriteString(summary)
+		builder.WriteString("CONTEXT: The user was just shown the following summary. Use this summary to answer any follow-up questions.\n--- SUMMARY START ---\n")
+		builder.WriteString(summaryCtx.Summary)
+		if summaryCtx.ChannelID != "" {
+			builder.WriteString(fmt.Sprintf("\n(The summary was for channel %s)", summaryCtx.ChannelID))
+		}
 		builder.WriteString("\n--- SUMMARY END ---\n\n")
 		// The summary context is now loaded. Delete it so it's not used in the *next* turn.
 		delete(p.lastSummary, userID)
@@ -214,14 +290,60 @@ func (p *Processor) continueConversation(userID string, history []string) string
 	if err != nil {
 		return response // Error message is already formatted
 	}
-	return response
+	return cleanGeminiResponse(response)
 }
 
 // ConsolidateInfo uses the AI to create a summary from Slack messages and Jira issues.
 // This is used by the /summary slash command.
 func (p *Processor) ConsolidateInfo(userID string, slackMessages, jiraIssues []string) string { // Added userID
 	var builder strings.Builder
-	builder.WriteString("Please provide a concise summary of the following activities. Include both Slack messages and Jira issues.\n\n")
+	builder.WriteString(`Please provide a concise summary of the following activities in Slack's Block Kit JSON format. The JSON should be a valid array of blocks.
+
+Use a header for "Slack Conversations" and "Jira Issues", and a divider between them.
+
+Example of the desired format:
+[
+    {
+        "type": "header",
+        "text": {
+            "type": "plain_text",
+            "text": "Activity Summary"
+        }
+    },
+    {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": "*Slack Conversations:*"
+        }
+    },
+    {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": "- Message 1"
+        }
+    },
+    {
+        "type": "divider"
+    },
+    {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": "*Jira Issues:*"
+        }
+    },
+    {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": "- Issue 1"
+        }
+    }
+]
+
+`)
 
 	if len(slackMessages) > 0 {
 		builder.WriteString("Slack Conversations:\n")
@@ -247,7 +369,7 @@ func (p *Processor) ConsolidateInfo(userID string, slackMessages, jiraIssues []s
 	if err != nil {
 		return "I was able to fetch the activities, but I encountered an error while generating the summary."
 	}
-	return summary
+	return cleanGeminiResponse(summary)
 }
 
 // highlightMentions replaces mentions of the userID with a bolded version for Slack markdown.
@@ -255,4 +377,13 @@ func highlightMentions(text, userID string) string {
 	mentionTag := fmt.Sprintf("<@%s>", userID)
 	highlightedMentionTag := fmt.Sprintf("*<@%s>*", userID)
 	return strings.ReplaceAll(text, mentionTag, highlightedMentionTag)
+}
+
+// cleanGeminiResponse removes markdown formatting from the Gemini response.
+func cleanGeminiResponse(response string) string {
+	response = strings.TrimPrefix(response, "```json")
+	response = strings.TrimPrefix(response, "```")
+	response = strings.TrimSuffix(response, "```")
+	response = strings.TrimSpace(response)
+	return response
 }

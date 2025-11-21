@@ -104,7 +104,7 @@ func (h *SlashCommandHandler) processSummaryCommand(userID, requestChannelID, co
 	summary := h.agent.ConsolidateInfo(userID, allMessages, jiraIssues)
 
 	// Store the summary for potential follow-up questions in a DM.
-	h.agent.SetLastSummary(userID, summary)
+	h.agent.SetLastSummary(userID, requestChannelID, summary)
 
 	h.slackClient.SendMessage(requestChannelID, summary)
 }

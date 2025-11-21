@@ -70,7 +70,7 @@ func (h *SlackEventHandler) HandleEvent(w http.ResponseWriter, r *http.Request) 
 					return
 				}
 				// For mentions, we don't use history, just a direct response.
-				response := h.agent.ProcessMessage(ev.Text)
+				response := h.agent.ProcessMessage(ev.User, ev.Channel, ev.Text)
 				h.slackClient.SendMessage(ev.Channel, response)
 
 			case *slackevents.MessageEvent:

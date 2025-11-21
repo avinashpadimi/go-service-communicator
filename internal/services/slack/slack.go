@@ -1,9 +1,12 @@
 package slack
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/slack-go/slack"
@@ -11,14 +14,17 @@ import (
 
 // Client is a Slack client that uses the slack-go library.
 type Client struct {
-	api *slack.Client
+	api        *slack.Client
+	userCache  map[string]string
+	cacheMutex sync.Mutex
 }
 
 // New creates a new Slack client.
 func New(token string) *Client {
 	api := slack.New(token)
 	return &Client{
-		api: api,
+		api:       api,
+		userCache: make(map[string]string),
 	}
 }
 
@@ -28,11 +34,61 @@ func (c *Client) AuthTest() (*slack.AuthTestResponse, error) {
 	return c.api.AuthTest()
 }
 
-// SendMessage sends a message to a Slack channel.
+// SendMessage sends a message to a Slack channel using blocks.
 func (c *Client) SendMessage(channel, message string) error {
 	log.Printf("Calling Slack API: chat.postMessage to channel %s", channel)
-	_, _, err := c.api.PostMessage(channel, slack.MsgOptionText(message, false))
-	return err
+
+	// Try to unmarshal the message as Slack message blocks
+	var blocks slack.Blocks
+	err := json.Unmarshal([]byte(message), &blocks)
+	if err == nil {
+		// If unmarshalling succeeds, send the blocks.
+		_, _, postErr := c.api.PostMessage(channel, slack.MsgOptionBlocks(blocks.BlockSet...))
+		return postErr
+	}
+
+	// If unmarshalling fails, assume it's a plain text message and use formatText.
+	log.Printf("Could not unmarshal message as JSON blocks, formatting as plain text: %v", err)
+	formattedBlocks := c.formatText(message)
+	_, _, postErr := c.api.PostMessage(
+		channel,
+		slack.MsgOptionBlocks(formattedBlocks...),
+	)
+	return postErr
+}
+
+func (c *Client) formatText(message string) []slack.Block {
+	var blocks []slack.Block
+	lines := strings.Split(message, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var textObj *slack.TextBlockObject
+
+		// Detect headings (lines starting with "#")
+		if strings.HasPrefix(line, "#") {
+			heading := strings.TrimLeft(line, "# ")
+			textObj = slack.NewTextBlockObject("mrkdwn", "*"+heading+"*", false, false)
+		} else if strings.HasPrefix(line, "```") {
+			// Code block lines (preserve exactly)
+			textObj = slack.NewTextBlockObject("mrkdwn", line, false, false)
+		} else if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "*") {
+			// Bullet point
+			bullet := strings.TrimLeft(line, "-*")
+			textObj = slack.NewTextBlockObject("mrkdwn", "• "+bullet, false, false)
+		} else {
+			// Regular text
+			textObj = slack.NewTextBlockObject("mrkdwn", line, false, false)
+		}
+
+		section := slack.NewSectionBlock(textObj, nil, nil)
+		blocks = append(blocks, section)
+	}
+	return blocks
 }
 
 // GetConversationHistory fetches the conversation history from a channel.
@@ -50,11 +106,36 @@ func (c *Client) GetConversationHistory(channelID string, start, end time.Time) 
 	}
 
 	var messages []string
-	for _, msg := range history.Messages {
-		messages = append(messages, msg.Text)
+	for i := len(history.Messages) - 1; i >= 0; i-- {
+		msg := history.Messages[i]
+		if msg.BotID != "" {
+			messages = append(messages, fmt.Sprintf("%s (bot): %s", msg.Username, msg.Text))
+		} else {
+			userName := c.getUserName(msg.User)
+			messages = append(messages, fmt.Sprintf("%s (<@%s>): %s", userName, msg.User, msg.Text))
+		}
 	}
 
 	return messages, nil
+}
+
+// getUserName fetches a user's name from the cache or the API.
+func (c *Client) getUserName(userID string) string {
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+
+	if userName, ok := c.userCache[userID]; ok {
+		return userName
+	}
+
+	user, err := c.api.GetUserInfo(userID)
+	if err != nil {
+		log.Printf("Error getting user info for %s: %v", userID, err)
+		return userID // Fallback to user ID
+	}
+
+	c.userCache[userID] = user.Name
+	return user.Name
 }
 
 // GetPublicChannels fetches a list of all channels the bot is a member of, using cursor pagination.
